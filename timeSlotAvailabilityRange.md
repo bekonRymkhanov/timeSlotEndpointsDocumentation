@@ -1,4 +1,4 @@
-# `GET /time-slots/availability-range`
+# `GET /time-slots/available-range`
 
 Возвращает доступные тайм-слоты за **диапазон дат**, сгруппированные по датам.
 
@@ -14,7 +14,7 @@
 
 | Метод | Путь                          | Авторизация  |
 |-------|-------------------------------|--------------|
-| GET   | `/time-slots/availability-range` | Bearer-токен |
+| GET   | `/time-slots/available-range` | Bearer-токен |
 
 ### Параметры запроса (query)
 
@@ -115,7 +115,7 @@
 Запрос на дев среду:
 
 ```
-GET https://gateway.spark-dev.team/dispatcher/api/time-slots/availability-range?timeFrom=2026-04-23&timeTo=2026-04-25&latitude=43.238949&longitude=76.889709&typeId=2
+GET https://gateway.spark-dev.team/dispatcher/api/time-slots/available-range?timeFrom=2026-04-23&timeTo=2026-04-25&latitude=43.238949&longitude=76.889709&typeId=2
 Authorization: Bearer <token>
 X-User: 42
 ```
@@ -123,7 +123,7 @@ X-User: 42
 На прод среду:
 
 ```
-GET https://gateway.spark.kz/dispatcher/api/time-slots/availability-range?timeFrom=2026-04-23&timeTo=2026-04-25&latitude=43.238949&longitude=76.889709&typeId=2
+GET https://gateway.spark.kz/dispatcher/api/time-slots/available-range?timeFrom=2026-04-23&timeTo=2026-04-25&latitude=43.238949&longitude=76.889709&typeId=2
 Authorization: Bearer <token>
 X-User: 42
 ```
