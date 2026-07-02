@@ -39,6 +39,30 @@ Routing Problem)**.
 > делает самоперезапускающаяся job — крон из расписания убран, но сама консольная
 > команда сохранена как ручной/резервный «сборщик» (см. раздел 7).
 
+### Автоподхват уже назначенных заказов курьера
+
+Если у водителя выбранной машины **уже есть** заборы/доставки, назначенные на эту дату,
+система **сама добавляет их в маршрут и жёстко закрепляет за этой машиной** — Yandex обязан
+оставить эти точки именно на этом курьере, а не переносить их на другую машину и не
+выбрасывать. Пример: выбрана машина `1` с заборами `[2]` и доставками `[3]`, а у её курьера
+на этот день уже назначен забор `6` — в Yandex уйдут заборы `2, 6` и доставка `3`, причём
+`6` привязан к машине `1`.
+
+Что подхватывается (на дату маршрута):
+- **заборы** курьера с `take_date` = дата маршрута и статусом «ещё не завершён»
+  (`StatusType::ORDER_TAKE_INCOMPLETED_STATUSES`);
+- **доставки** курьера, у которых `invoice.delivery_date` = дата маршрута и статус ≠ «доставлен»
+  (`StatusType::ID_DELIVERED`).
+
+Явно выбранные диспетчером заказы **не** закрепляются — Yandex распределяет их свободно.
+Заказы, уже указанные в запросе, повторно не добавляются. Автоподхваченный заказ без координат
+или с нулевым весом **молча пропускается** (в отличие от явно выбранных — те дают ошибку
+валидации). Технически закрепление реализовано через теги Yandex (см. раздел 6).
+
+> Обратного назначения курьера на заказы **после** расчёта не делается: привязка нужна только
+> для того, чтобы Yandex построил маршрут с учётом уже висящей на курьере работы. Статусы
+> заборов/доставок и `courier_id` этой фичей не меняются.
+
 ### Статусы маршрута
 
 | Код | Значение | Когда выставляется |
@@ -63,6 +87,7 @@ Routing Problem)**.
  │        • загрузка машин / заборов / доставок                   │
  │        • определение склада-депо по city_id                    │
  │        • проверки (координаты, вес, is_routing)                │
+ │        • автоподхват заказов курьера + закрепление (pinned)     │
  │        • сохранение Route + CarRoute[] + RouteClient[] (PENDING)│
  │        • сборка тела запроса (RoutePlanRequestBuilder)         │
  │        • ОТПРАВКА в Yandex (POST /vrs/api/v1/add/mvrp)         │
@@ -192,6 +217,7 @@ Routing Problem)**.
 | `clientId` | ID забора или доставки |
 | `position` | Порядок объезда |
 | `status` | `0` — в ожидании, `1` — в маршруте, `2` — не вписан |
+| `pinnedCarId` | ID машины, за которой закреплена точка (заказ уже был назначен курьеру); `null` у обычных |
 | `dropReason` | Причина, если не вписан |
 | `latitude`, `longitude` | Координаты точки |
 | `weight`, `volume` | Вес и объём |
@@ -278,6 +304,12 @@ Routing Problem)**.
    - должен найтись склад-депо.
    - Координаты проходят через `toCoordinate`: `null`/пусто/не-число/`0.0` считаются
      отсутствующими.
+3a. **Автоподхват заказов курьера** (`attachCourierOrders`, после валидации, до транзакции):
+   по каждой машине с активным водителем (`activeDriver`) через `RoutePlanQuery::getCourierTakes` /
+   `getCourierDeliveries` берутся ещё не завершённые заборы (по `take_date`) и доставки (по
+   `invoice.delivery_date`) на дату маршрута, которых ещё нет в запросе. Точки без координат или
+   с `weight <= 0` молча пропускаются. Остальные добавляются в наборы заборов/доставок, а карта
+   «id заказа → id машины» (`pins`) запоминает, за какой машиной их закрепить.
 4. **Сохранение** (в одной транзакции `DB::transaction`):
    - `Route` (`user_id`, `company_id` = у первой машины, `city_id`, `date`,
      `status = PENDING`, `depot_lat/lon`);
@@ -287,7 +319,8 @@ Routing Problem)**.
      `08:00:00`/`19:00:00`);
    - `RouteClient` на каждый забор/доставку: полиморфная связь (`client_id` +
      `client_type` = `OrderTake::class`/`Delivery::class`), `type`, `status = PENDING`,
-     снимок координат/веса/объёма.
+     снимок координат/веса/объёма, а также `pinned_car_id` из карты `pins` (`null` для явно
+     выбранных заказов, `car_id` — для автоподхваченных).
 5. **Отправка + запуск опроса** (`submit`, **после** коммита транзакции, синхронно):
    перезагружает `carRoutes.car.carType` + `routeClients`, собирает тело
    (`RoutePlanRequestBuilder`), вызывает `IntegrationRoutePlanRepository::submit`. Пишет
@@ -309,12 +342,21 @@ Routing Problem)**.
 
 ```
 depot:      { id:"0", ref:"Склад", time_window, point:{lat,lon} }        // из routes.depot_*
-vehicles[]: { id:car_id, ref:car_number,
+vehicles[]: { id:car_id, ref:car_number, tags:["car-<car_id>"],
               capacity:{ weight_kg, volume_cbm, units }, shifts:[{ id:"0", time_window }] }
 locations[]:{ id:route_client.id, ref, time_window, point:{lat,lon},
-              shipment_size:{ weight_kg, volume_cbm, units:1 }, service_duration_s }
+              shipment_size:{ weight_kg, volume_cbm, units:1 }, service_duration_s,
+              required_tags:["car-<pinned_car_id>"]   // ← ТОЛЬКО у закреплённых точек }
 options:    { time_zone, quality, date }
 ```
+
+**Закрепление точки за машиной (теги).** У каждой машины есть уникальный тег `car-<car_id>`
+(`vehicles[].tags`). Точка может быть обслужена машиной, только если один из тегов машины
+совпадает с `required_tags` точки. Поэтому автоподхваченным (закреплённым) точкам проставляется
+`required_tags: ["car-<pinned_car_id>"]` — и Yandex обязан оставить их на этом курьере. У явно
+выбранных заказов `required_tags` **нет**, поэтому Yandex распределяет их свободно. Префикс тега —
+`RoutePlanRequestBuilder::VEHICLE_TAG_PREFIX` (`car-`); тег машины и `required_tags` точки должны
+использовать один и тот же префикс.
 
 Грузоподъёмность машины берётся из `Car`: `getRoutingWeightCapacity()` =
 `carType.capacity`, `getRoutingVolume()` = `cubature` или `carType.volume`,
@@ -400,7 +442,7 @@ options:    { time_zone, quality, date }
 |---------|--------|---------------|
 | `routes` | `Route` | `user_id, company_id, city_id, date, status(1/2/3), task_id, depot_lat, depot_lon, error` + softDeletes |
 | `car_routes` | `CarRoute` | `route_id, car_id, car_number, driver_*, work_start/end, total_weight/volume, stops_count` + softDeletes |
-| `route_clients` | `RouteClient` | `route_id, car_route_id?, type(1/2), client_id+client_type (морф), position, status(0/1/2), drop_reason, lat/lon, weight, volume, arrival_at` + softDeletes |
+| `route_clients` | `RouteClient` | `route_id, car_route_id?, pinned_car_id?, type(1/2), client_id+client_type (морф), position, status(0/1/2), drop_reason, lat/lon, weight, volume, arrival_at` + softDeletes |
 | `route_results` | `RouteResult` | `route_id, type(mvrp_submit/mvrp_result), task_id, status_code, request_body, response_body` (аудит-лог) |
 
 Новые поля в существующих таблицах: `cars.is_routing` (bool, по умолчанию false),
@@ -454,6 +496,10 @@ options:    { time_zone, quality, date }
   job страховки в виде авто-пере-сканирования нет — держите резервный «сборщик» (раздел 7).
 - **Соглашение об id** (машина = `car_id`, точка = `route_client.id`) обязательно к
   соблюдению: по нему результат Yandex сопоставляется обратно с нашими записями.
+- **Закрепление заказов курьера** делается тегами (`vehicles[].tags` = `car-<car_id>`,
+  `locations[].required_tags` у закреплённых точек). Меняете префикс/схему тега — меняйте
+  сразу с обеих сторон (см. раздел 6). `pinned_car_id != null` ⇔ точка автоподхвачена и
+  закреплена; помощник модели — `RouteClient::isPinned()`.
 - **Тестовые данные:** `database/seeders/RoutePlanTestSeeder.php` создаёт одну машину с
   водителем, один забор и одну доставку в одном городе. Запуск:
   `php artisan db:seed --class=RoutePlanTestSeeder` — выводит готовое тело для
